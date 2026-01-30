@@ -3,56 +3,82 @@ package turn
 import (
 	"net"
 	"strconv"
+	"time"
 
 	"github.com/flutter-webrtc/flutter-webrtc-server/pkg/logger"
 	"github.com/pion/turn/v2"
 )
 
 type TurnServerConfig struct {
-	PublicIP string
-	Port     int
-	Realm    string
+	PublicIP    string
+	Port        int
+	Realm       string
+	AuthSecret  string // ADD THIS - Shared secret for TURN auth
 }
 
 func DefaultConfig() TurnServerConfig {
 	return TurnServerConfig{
-		PublicIP: "127.0.0.1",
-		Port:     19302,
-		Realm:    "flutter-webrtc",
+		PublicIP:   "", // Should come from config
+		Port:       3478,
+		Realm:      "flutter-webrtc.org",
+		AuthSecret: "", // Must be set from config
 	}
 }
 
-/*
-if key, ok := usersMap[username]; ok {
-				return key, true
-			}
-			return nil, false
-*/
-
 type TurnServer struct {
-	udpListener net.PacketConn
-	turnServer  *turn.Server
-	Config      TurnServerConfig
-	AuthHandler func(username string, realm string, srcAddr net.Addr) (string, bool)
+	turnServer *turn.Server
+	Config     TurnServerConfig
+	// Remove AuthHandler - we'll use shared secret auth
 }
 
 func NewTurnServer(config TurnServerConfig) *TurnServer {
-	server := &TurnServer{
-		Config:      config,
-		AuthHandler: nil,
+	if config.PublicIP == "" {
+		logger.Panicf("TURN public_ip is required")
 	}
-	if len(config.PublicIP) == 0 {
-		logger.Panicf("'public-ip' is required")
+	
+	if config.AuthSecret == "" {
+		logger.Panicf("TURN auth_secret is required for authentication")
 	}
+
+	// Create UDP listener
 	udpListener, err := net.ListenPacket("udp4", "0.0.0.0:"+strconv.Itoa(config.Port))
 	if err != nil {
-		logger.Panicf("Failed to create TURN server listener: %s", err)
+		logger.Panicf("TURN UDP failed to listen on port %d: %v", config.Port, err)
 	}
-	server.udpListener = udpListener
+
+	// Create TCP listener
+	tcpListener, err := net.Listen("tcp4", "0.0.0.0:"+strconv.Itoa(config.Port))
+	if err != nil {
+		logger.Panicf("TURN TCP failed to listen on port %d: %v", config.Port, err)
+	}
+
+	// Using long-term credential authentication with shared secret
+	usersMap := map[string][]byte{}
+	
+	// For shared secret auth, we need to generate credentials dynamically
+	// The actual auth will be handled by the AuthHandler below
 
 	turnServer, err := turn.NewServer(turn.ServerConfig{
-		Realm:       config.Realm,
-		AuthHandler: server.HandleAuthenticate,
+		Realm: config.Realm,
+		
+		// Use shared secret authentication (recommended for production)
+		AuthHandler: func(username string, realm string, srcAddr net.Addr) ([]byte, bool) {
+			// Generate credentials based on shared secret
+			// This allows temporary credentials for WebRTC
+			
+			// For long-term credential auth with shared secret:
+			// The username is typically a timestamp + something
+			// and password is generated from the shared secret
+			
+			if config.AuthSecret == "" {
+				return nil, false
+			}
+			
+			// Generate key for this username/realm combination
+			key := turn.GenerateAuthKey(username, realm, config.AuthSecret)
+			return key, true
+		},
+		
 		PacketConnConfigs: []turn.PacketConnConfig{
 			{
 				PacketConn: udpListener,
@@ -62,23 +88,50 @@ func NewTurnServer(config TurnServerConfig) *TurnServer {
 				},
 			},
 		},
+		ListenerConfigs: []turn.ListenerConfig{
+			{
+				Listener: tcpListener,
+				RelayAddressGenerator: &turn.RelayAddressGeneratorStatic{
+					RelayAddress: net.ParseIP(config.PublicIP),
+					Address:      "0.0.0.0",
+				},
+			},
+		},
+		
+		// Set relay address for media
+		RelayAddressGenerator: &turn.RelayAddressGeneratorStatic{
+			RelayAddress: net.ParseIP(config.PublicIP),
+			Address:      "0.0.0.0",
+		},
 	})
+	
 	if err != nil {
-		logger.Panicf("%v", err)
+		logger.Panicf("TURN server creation failed: %v", err)
 	}
-	server.turnServer = turnServer
-	return server
+
+	logger.Infof("TURN server started on %s:%d (UDP/TCP)", config.PublicIP, config.Port)
+	
+	return &TurnServer{
+		turnServer: turnServer,
+		Config:     config,
+	}
 }
 
-func (s *TurnServer) HandleAuthenticate(username string, realm string, srcAddr net.Addr) ([]byte, bool) {
-	if s.AuthHandler != nil {
-		if password, ok := s.AuthHandler(username, realm, srcAddr); ok {
-			return turn.GenerateAuthKey(username, realm, password), true
-		}
-	}
-	return nil, false
+// GetTURNCredentials generates TURN credentials for clients
+func (s *TurnServer) GetTURNCredentials() (username string, password string) {
+	// Generate temporary credentials (24-hour validity)
+	// This is the standard way for WebRTC TURN servers
+	unixTime := time.Now().Add(24 * time.Hour).Unix()
+	username = strconv.FormatInt(unixTime, 10)
+	
+	// Generate password using shared secret
+	password = turn.GenerateAuthKey(username, s.Config.Realm, s.Config.AuthSecret)
+	return username, password
 }
 
 func (s *TurnServer) Close() error {
-	return s.turnServer.Close()
+	if s.turnServer != nil {
+		return s.turnServer.Close()
+	}
+	return nil
 }

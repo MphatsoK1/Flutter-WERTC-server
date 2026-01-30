@@ -2,183 +2,144 @@ package util
 
 import (
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/flutter-webrtc/flutter-webrtc-server/pkg/logger"
 )
 
-type val struct {
-	data        interface{}
-	expiredTime int64
+// SimpleExpiredMap is a thread-safe map with TTL expiration
+// Optimized for TURN credential storage use case
+type SimpleExpiredMap struct {
+	mu   sync.RWMutex
+	data map[interface{}]*expiredValue
 }
 
-const delChannelCap = 100
-
-type ExpiredMap struct {
-	m        map[interface{}]*val
-	timeMap  map[int64][]interface{}
-	lck      *sync.Mutex
-	stop     chan struct{}
-	needStop int32
+type expiredValue struct {
+	value      interface{}
+	expiration time.Time
 }
 
-func NewExpiredMap() *ExpiredMap {
-	e := ExpiredMap{
-		m:       make(map[interface{}]*val),
-		lck:     new(sync.Mutex),
-		timeMap: make(map[int64][]interface{}),
-		stop:    make(chan struct{}),
-	}
-	atomic.StoreInt32(&e.needStop, 0)
-	go e.run(time.Now().Unix())
-	return &e
-}
-
-type delMsg struct {
-	keys []interface{}
-	t    int64
-}
-
-func (e *ExpiredMap) run(now int64) {
-	t := time.NewTicker(time.Second * 1)
-	delCh := make(chan *delMsg, delChannelCap)
-	go func() {
-		for v := range delCh {
-			if atomic.LoadInt32(&e.needStop) == 1 {
-				logger.Infof("---del stop---")
-				return
-			}
-			e.multiDelete(v.keys, v.t)
-		}
-	}()
-	for {
-		select {
-		case <-t.C:
-			now++
-			if keys, found := e.timeMap[now]; found {
-				delCh <- &delMsg{keys: keys, t: now}
-			}
-		case <-e.stop:
-			logger.Infof("=== STOP ===")
-			atomic.StoreInt32(&e.needStop, 1)
-			delCh <- &delMsg{keys: []interface{}{}, t: 0}
-			return
-		}
+// NewExpiredMap creates a new TTL map optimized for TURN credentials
+func NewExpiredMap() *SimpleExpiredMap {
+	return &SimpleExpiredMap{
+		data: make(map[interface{}]*expiredValue),
 	}
 }
 
-func (e *ExpiredMap) Set(key, value interface{}, expireSeconds int64) {
-	if expireSeconds <= 0 {
+// Set adds a key with TTL (in seconds)
+func (m *SimpleExpiredMap) Set(key, value interface{}, ttlSeconds int64) {
+	if ttlSeconds <= 0 {
 		return
 	}
-	logger.Debugf("ExpiredMap: Set %s ttl[%d] => %v", key, expireSeconds, value)
-	e.lck.Lock()
-	defer e.lck.Unlock()
-	expiredTime := time.Now().Unix() + expireSeconds
-	e.m[key] = &val{
-		data:        value,
-		expiredTime: expiredTime,
+	
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	
+	expiration := time.Now().Add(time.Duration(ttlSeconds) * time.Second)
+	m.data[key] = &expiredValue{
+		value:      value,
+		expiration: expiration,
 	}
-	e.timeMap[expiredTime] = append(e.timeMap[expiredTime], key)
+	
+	logger.Debugf("ExpiredMap: Set %v with TTL %d seconds", key, ttlSeconds)
 }
 
-func (e *ExpiredMap) Get(key interface{}) (found bool, value interface{}) {
-	e.lck.Lock()
-	defer e.lck.Unlock()
-	if found = e.checkDeleteKey(key); !found {
-		return
-	}
-	value = e.m[key].data
-	return
-}
-
-func (e *ExpiredMap) Delete(key interface{}) {
-	e.lck.Lock()
-	delete(e.m, key)
-	e.lck.Unlock()
-}
-
-func (e *ExpiredMap) Remove(key interface{}) {
-	e.Delete(key)
-}
-
-func (e *ExpiredMap) multiDelete(keys []interface{}, t int64) {
-	e.lck.Lock()
-	defer e.lck.Unlock()
-	delete(e.timeMap, t)
-	for _, key := range keys {
-		delete(e.m, key)
-	}
-}
-
-func (e *ExpiredMap) Length() int {
-	e.lck.Lock()
-	defer e.lck.Unlock()
-	return len(e.m)
-}
-
-func (e *ExpiredMap) Size() int {
-	return e.Length()
-}
-
-func (e *ExpiredMap) TTL(key interface{}) int64 {
-	e.lck.Lock()
-	defer e.lck.Unlock()
-	if !e.checkDeleteKey(key) {
-		return -1
-	}
-	return e.m[key].expiredTime - time.Now().Unix()
-}
-
-func (e *ExpiredMap) Clear() {
-	e.lck.Lock()
-	defer e.lck.Unlock()
-	e.m = make(map[interface{}]*val)
-	e.timeMap = make(map[int64][]interface{})
-}
-
-func (e *ExpiredMap) Close() {
-	e.lck.Lock()
-	defer e.lck.Unlock()
-	e.stop <- struct{}{}
-}
-
-func (e *ExpiredMap) Stop() {
-	e.Close()
-}
-
-func (e *ExpiredMap) DoForEach(handler func(interface{}, interface{})) {
-	e.lck.Lock()
-	defer e.lck.Unlock()
-	for k, v := range e.m {
-		if !e.checkDeleteKey(k) {
-			continue
+// Get retrieves a value if it exists and hasn't expired
+func (m *SimpleExpiredMap) Get(key interface{}) (found bool, value interface{}) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	
+	// Check if key exists and hasn't expired
+	if ev, exists := m.data[key]; exists {
+		if time.Now().After(ev.expiration) {
+			// Clean up expired entry
+			delete(m.data, key)
+			return false, nil
 		}
-		handler(k, v)
+		return true, ev.value
 	}
+	
+	return false, nil
 }
 
-func (e *ExpiredMap) DoForEachWithBreak(handler func(interface{}, interface{}) bool) {
-	e.lck.Lock()
-	defer e.lck.Unlock()
-	for k, v := range e.m {
-		if !e.checkDeleteKey(k) {
-			continue
-		}
-		if handler(k, v) {
-			break
+// Delete removes a key immediately
+func (m *SimpleExpiredMap) Delete(key interface{}) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.data, key)
+}
+
+// Remove is an alias for Delete
+func (m *SimpleExpiredMap) Remove(key interface{}) {
+	m.Delete(key)
+}
+
+// Cleanup removes all expired entries
+func (m *SimpleExpiredMap) Cleanup() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	
+	now := time.Now()
+	for key, ev := range m.data {
+		if now.After(ev.expiration) {
+			delete(m.data, key)
 		}
 	}
 }
 
-func (e *ExpiredMap) checkDeleteKey(key interface{}) bool {
-	if val, found := e.m[key]; found {
-		if val.expiredTime <= time.Now().Unix() {
-			delete(e.m, key)
-			return false
+// Length returns the number of non-expired entries
+func (m *SimpleExpiredMap) Length() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	
+	// Only count non-expired entries
+	count := 0
+	now := time.Now()
+	for _, ev := range m.data {
+		if !now.After(ev.expiration) {
+			count++
 		}
-		return true
 	}
-	return false
+	return count
+}
+
+// Size is an alias for Length
+func (m *SimpleExpiredMap) Size() int {
+	return m.Length()
+}
+
+// TTL returns remaining seconds until expiration
+func (m *SimpleExpiredMap) TTL(key interface{}) int64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	
+	if ev, exists := m.data[key]; exists {
+		remaining := time.Until(ev.expiration)
+		if remaining <= 0 {
+			delete(m.data, key)
+			return -1
+		}
+		return int64(remaining.Seconds())
+	}
+	return -1
+}
+
+// Clear removes all entries
+func (m *SimpleExpiredMap) Clear() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.data = make(map[interface{}]*expiredValue)
+}
+
+// DoForEach iterates over non-expired entries
+func (m *SimpleExpiredMap) DoForEach(handler func(interface{}, interface{})) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	
+	now := time.Now()
+	for key, ev := range m.data {
+		if !now.After(ev.expiration) {
+			handler(key, ev.value)
+		}
+	}
 }

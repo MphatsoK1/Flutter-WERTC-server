@@ -1,8 +1,8 @@
 package websocket
 
 import (
+	"context"
 	"errors"
-	"net"
 	"sync"
 	"time"
 
@@ -11,99 +11,196 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-const pingPeriod = 5 * time.Second
+const (
+	// Connection timeouts
+	writeWait      = 10 * time.Second
+	pongWait       = 60 * time.Second
+	pingPeriod     = (pongWait * 9) / 10 // Send pings more frequently than pong timeout
+	maxMessageSize = 512 * 1024          // 512KB max message size
+)
 
 type WebSocketConn struct {
 	emission.Emitter
-	socket *websocket.Conn
-	mutex  *sync.Mutex
-	closed bool
+	socket    *websocket.Conn
+	mutex     *sync.RWMutex
+	closed    bool
+	closeOnce sync.Once
+	ctx       context.Context
+	cancel    context.CancelFunc
 }
 
 func NewWebSocketConn(socket *websocket.Conn) *WebSocketConn {
-	var conn WebSocketConn
-	conn.Emitter = *emission.NewEmitter()
-	conn.socket = socket
-	conn.mutex = new(sync.Mutex)
-	conn.closed = false
-	conn.socket.SetCloseHandler(func(code int, text string) error {
-		logger.Warnf("%s [%d]", text, code)
-		conn.Emit("close", code, text)
-		conn.closed = true
+	ctx, cancel := context.WithCancel(context.Background())
+	
+	conn := &WebSocketConn{
+		Emitter: *emission.NewEmitter(),
+		socket:  socket,
+		mutex:   new(sync.RWMutex),
+		closed:  false,
+		ctx:     ctx,
+		cancel:  cancel,
+	}
+	
+	// Configure WebSocket connection
+	conn.socket.SetReadLimit(maxMessageSize)
+	conn.socket.SetReadDeadline(time.Now().Add(pongWait))
+	
+	// Set proper WebSocket ping/pong handlers (CRITICAL for cross-network)
+	conn.socket.SetPongHandler(func(string) error {
+		conn.socket.SetReadDeadline(time.Now().Add(pongWait))
 		return nil
 	})
-	return &conn
+	
+	// Set close handler
+	conn.socket.SetCloseHandler(func(code int, text string) error {
+		logger.Debugf("WebSocket close: %s [%d]", text, code)
+		conn.internalClose(code, text)
+		return nil
+	})
+	
+	return conn
 }
 
 func (conn *WebSocketConn) ReadMessage() {
-	in := make(chan []byte)
-	stop := make(chan struct{})
+	// Start ping ticker
 	pingTicker := time.NewTicker(pingPeriod)
-
-	var c = conn.socket
-	go func() {
-		for {
-			_, message, err := c.ReadMessage()
-			if err != nil {
-				logger.Warnf("Got error: %v", err)
-				if c, k := err.(*websocket.CloseError); k {
-					conn.Emit("close", c.Code, c.Text)
-				} else {
-					if c, k := err.(*net.OpError); k {
-						conn.Emit("close", 1008, c.Error())
-					}
-				}
-				close(stop)
-				break
-			}
-			in <- message
-		}
+	defer func() {
+		pingTicker.Stop()
+		conn.internalClose(1000, "reader stopped")
 	}()
 
+	// Message processing goroutine
 	for {
 		select {
-		case _ = <-pingTicker.C:
-			logger.Infof("Send keepalive !!!")
-			if err := conn.Send("{}"); err != nil {
-				logger.Errorf("Keepalive has failed")
-				pingTicker.Stop()
+		case <-conn.ctx.Done():
+			return
+		case <-pingTicker.C:
+			// Send WebSocket ping frame (not text message)
+			conn.mutex.Lock()
+			if !conn.closed {
+				conn.socket.SetWriteDeadline(time.Now().Add(writeWait))
+				if err := conn.socket.WriteMessage(websocket.PingMessage, nil); err != nil {
+					logger.Debugf("Failed to send ping: %v", err)
+					conn.mutex.Unlock()
+					return
+				}
+			}
+			conn.mutex.Unlock()
+		default:
+			// Read message with timeout
+			conn.socket.SetReadDeadline(time.Now().Add(pongWait))
+			messageType, message, err := conn.socket.ReadMessage()
+			
+			if err != nil {
+				if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
+					logger.Debugf("WebSocket read error: %v", err)
+				}
+				conn.internalClose(1006, err.Error())
 				return
 			}
-		case message := <-in:
-			{
-				logger.Infof("Recivied data: %s", message)
-				conn.Emit("message", []byte(message))
+			
+			if messageType == websocket.TextMessage || messageType == websocket.BinaryMessage {
+				conn.Emit("message", message)
+			} else if messageType == websocket.CloseMessage {
+				return
 			}
-		case <-stop:
-			return
 		}
 	}
 }
 
 /*
-* Send |message| to the connection.
- */
+* Send |message| to the connection with timeout.
+*/
 func (conn *WebSocketConn) Send(message string) error {
-	logger.Infof("Send data: %s", message)
+	conn.mutex.RLock()
+	if conn.closed {
+		conn.mutex.RUnlock()
+		return errors.New("websocket: connection closed")
+	}
+	
+	// Set write deadline
+	conn.socket.SetWriteDeadline(time.Now().Add(writeWait))
+	conn.mutex.RUnlock()
+	
 	conn.mutex.Lock()
 	defer conn.mutex.Unlock()
+	
+	// Double-check after acquiring write lock
 	if conn.closed {
-		return errors.New("websocket: write closed")
+		return errors.New("websocket: connection closed")
 	}
+	
+	logger.Debugf("Send data: %s", message)
 	return conn.socket.WriteMessage(websocket.TextMessage, []byte(message))
 }
 
 /*
-* Close conn.
- */
-func (conn *WebSocketConn) Close() {
+* Send binary data to the connection.
+*/
+func (conn *WebSocketConn) SendBinary(data []byte) error {
+	conn.mutex.RLock()
+	if conn.closed {
+		conn.mutex.RUnlock()
+		return errors.New("websocket: connection closed")
+	}
+	
+	conn.socket.SetWriteDeadline(time.Now().Add(writeWait))
+	conn.mutex.RUnlock()
+	
 	conn.mutex.Lock()
 	defer conn.mutex.Unlock()
-	if conn.closed == false {
-		logger.Infof("Close ws conn now : ", conn)
-		conn.socket.Close()
-		conn.closed = true
-	} else {
-		logger.Warnf("Transport already closed :", conn)
+	
+	if conn.closed {
+		return errors.New("websocket: connection closed")
 	}
+	
+	return conn.socket.WriteMessage(websocket.BinaryMessage, data)
+}
+
+/*
+* Close connection gracefully.
+*/
+func (conn *WebSocketConn) Close() {
+	conn.internalClose(1000, "normal closure")
+}
+
+/*
+* Internal close with proper cleanup.
+*/
+func (conn *WebSocketConn) internalClose(code int, reason string) {
+	conn.closeOnce.Do(func() {
+		conn.mutex.Lock()
+		defer conn.mutex.Unlock()
+		
+		if !conn.closed {
+			logger.Debugf("Closing WebSocket connection: %s [%d]", reason, code)
+			
+			// Send close message if possible
+			if conn.socket != nil {
+				conn.socket.SetWriteDeadline(time.Now().Add(writeWait))
+				conn.socket.WriteMessage(websocket.CloseMessage, 
+					websocket.FormatCloseMessage(code, reason))
+				conn.socket.Close()
+			}
+			
+			conn.closed = true
+			
+			// Cancel context to stop all goroutines
+			if conn.cancel != nil {
+				conn.cancel()
+			}
+			
+			// Emit close event
+			conn.Emit("close", code, reason)
+		}
+	})
+}
+
+/*
+* Check if connection is closed.
+*/
+func (conn *WebSocketConn) IsClosed() bool {
+	conn.mutex.RLock()
+	defer conn.mutex.RUnlock()
+	return conn.closed
 }

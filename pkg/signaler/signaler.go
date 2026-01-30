@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/flutter-webrtc/flutter-webrtc-server/pkg/logger"
@@ -18,9 +19,12 @@ import (
 	"github.com/flutter-webrtc/flutter-webrtc-server/pkg/websocket"
 )
 
+// Use the same shared key as TURN server
 const (
-	sharedKey = `flutter-webrtc-turn-server-shared-key`
+	sharedKey = "flutter-webrtc-turn-server-shared-key"
 )
+
+// -------------------- TURN --------------------
 
 type TurnCredentials struct {
 	Username string   `json:"username"`
@@ -29,13 +33,13 @@ type TurnCredentials struct {
 	Uris     []string `json:"uris"`
 }
 
-// Peer .
+// -------------------- SIGNALING --------------------
+
 type Peer struct {
 	info PeerInfo
 	conn *websocket.WebSocketConn
 }
 
-// Session info.
 type Session struct {
 	id   string
 	from Peer
@@ -81,258 +85,255 @@ type Error struct {
 	Reason  string `json:"reason"`
 }
 
+// -------------------- SIGNALER --------------------
+
 type Signaler struct {
 	peers     map[string]Peer
 	sessions  map[string]Session
 	turn      *turn.TurnServer
 	expresMap *util.ExpiredMap
+	mu        sync.RWMutex // Add mutex for thread safety
 }
 
 func NewSignaler(turn *turn.TurnServer) *Signaler {
-	var signaler = &Signaler{
+	s := &Signaler{
 		peers:     make(map[string]Peer),
 		sessions:  make(map[string]Session),
 		turn:      turn,
 		expresMap: util.NewExpiredMap(),
 	}
-	signaler.turn.AuthHandler = signaler.authHandler
-	return signaler
+	return s
 }
 
-func (s Signaler) authHandler(username string, realm string, srcAddr net.Addr) (string, bool) {
-	// handle turn credential.
+func (s *Signaler) authHandler(username, realm string, srcAddr net.Addr) (string, bool) {
 	if found, info := s.expresMap.Get(username); found {
-		credential := info.(TurnCredentials)
-		return credential.Password, true
+		cred := info.(TurnCredentials)
+		return cred.Password, true
 	}
 	return "", false
 }
 
-// NotifyPeersUpdate .
-func (s *Signaler) NotifyPeersUpdate(conn *websocket.WebSocketConn, peers map[string]Peer) {
-	infos := []PeerInfo{}
-	for _, peer := range peers {
-		infos = append(infos, peer.info)
-	}
+// -------------------- TURN CREDENTIAL ENDPOINT --------------------
 
-	request := Request{
-		Type: "peers",
-		Data: infos,
-	}
-	for _, peer := range peers {
-		s.Send(peer.conn, request)
-	}
-}
-
-// HandleTurnServerCredentials .
-// https://tools.ietf.org/html/draft-uberti-behave-turn-rest-00
-func (s *Signaler) HandleTurnServerCredentials(writer http.ResponseWriter, request *http.Request) {
-	writer.Header().Set("Content-Type", "application/json")
-	writer.Header().Set("Access-Control-Allow-Origin", "*")
-
-	params, err := url.ParseQuery(request.URL.RawQuery)
-	if err != nil {
-
-	}
-	logger.Debugf("%v", params)
-	service := params["service"][0]
-	if service != "turn" {
+func (s *Signaler) HandleTurnServerCredentials(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
+	
+	// Handle CORS preflight
+	if r.Method == "OPTIONS" {
+		w.WriteHeader(http.StatusOK)
 		return
 	}
-	username := params["username"][0]
+
+	if r.Method != "GET" {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	params, err := url.ParseQuery(r.URL.RawQuery)
+	if err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+
+	service := params.Get("service")
+	if service != "turn" {
+		http.Error(w, "invalid service", http.StatusBadRequest)
+		return
+	}
+
+	username := params.Get("username")
+	if username == "" {
+		http.Error(w, "missing username", http.StatusBadRequest)
+		return
+	}
+
+	// Use the actual TURN server configuration from turn object
+	if s.turn == nil {
+		http.Error(w, "TURN server not configured", http.StatusInternalServerError)
+		return
+	}
+
+	turnConfig := s.turn.Config
+	
+	// Generate timestamp-based username
 	timestamp := time.Now().Unix()
 	turnUsername := fmt.Sprintf("%d:%s", timestamp, username)
-	hmac := hmac.New(sha1.New, []byte(sharedKey))
-	hmac.Write([]byte(turnUsername))
-	turnPassword := base64.RawStdEncoding.EncodeToString(hmac.Sum(nil))
-	/*
-		{
-		     "username" : "12334939:mbzrxpgjys",
-		     "password" : "adfsaflsjfldssia",
-		     "ttl" : 86400,
-		     "uris" : [
-		       "turn:1.2.3.4:9991?transport=udp",
-		       "turn:1.2.3.4:9992?transport=tcp",
-		       "turns:1.2.3.4:443?transport=tcp"
-			 ]
-		}
-		For client pc.
-		var iceServer = {
-			"username": response.username,
-			"credential": response.password,
-			"uris": response.uris
-		};
-		var config = {"iceServers": [iceServer]};
-		var pc = new RTCPeerConnection(config);
 
-	*/
-	ttl := 86400
-	host := fmt.Sprintf("%s:%d", s.turn.Config.PublicIP, s.turn.Config.Port)
+	// Generate password using shared key (must match TURN server's auth secret)
+	h := hmac.New(sha1.New, []byte(turnConfig.AuthSecret))
+	h.Write([]byte(turnUsername))
+	password := base64.RawStdEncoding.EncodeToString(h.Sum(nil))
+
+	ttl := 86400 // 24 hours
+
+	// Generate TURN URIs using actual server configuration
+	uris := []string{
+		fmt.Sprintf("turn:%s:%d?transport=udp", turnConfig.PublicIP, turnConfig.Port),
+		fmt.Sprintf("turn:%s:%d?transport=tcp", turnConfig.PublicIP, turnConfig.Port),
+	}
+	
+	// If using TLS, also add turns:// URI
+	if strings.Contains(r.Host, "https") || r.TLS != nil {
+		uris = append(uris, fmt.Sprintf("turns:%s:443?transport=tcp", turnConfig.PublicIP))
+	}
+
 	credential := TurnCredentials{
 		Username: turnUsername,
-		Password: turnPassword,
+		Password: password,
 		TTL:      ttl,
-		Uris: []string{
-			"turn:" + host + "?transport=udp",
-		},
+		Uris:     uris,
 	}
+
+	// Store for TURN server authentication
 	s.expresMap.Set(turnUsername, credential, int64(ttl))
-	json.NewEncoder(writer).Encode(credential)
+	
+	// Return credentials
+	if err := json.NewEncoder(w).Encode(credential); err != nil {
+		logger.Errorf("Failed to encode TURN credentials: %v", err)
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+	}
 }
+
+// -------------------- WEBSOCKET --------------------
 
 func (s *Signaler) Send(conn *websocket.WebSocketConn, m interface{}) error {
 	data, err := json.Marshal(m)
 	if err != nil {
-		logger.Errorf(err.Error())
+		logger.Errorf("Failed to marshal message: %v", err)
 		return err
 	}
 	return conn.Send(string(data))
 }
 
-func (s *Signaler) HandleNewWebSocket(conn *websocket.WebSocketConn, request *http.Request) {
-	logger.Infof("On Open %v", request)
+func (s *Signaler) NotifyPeersUpdate(peers map[string]Peer) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	
+	infos := []PeerInfo{}
+	for _, p := range peers {
+		infos = append(infos, p.info)
+	}
+
+	req := Request{
+		Type: "peers",
+		Data: infos,
+	}
+
+	for _, p := range peers {
+		if err := s.Send(p.conn, req); err != nil {
+			logger.Warningf("Failed to send peer update to %s: %v", p.info.ID, err)
+		}
+	}
+}
+
+func (s *Signaler) HandleNewWebSocket(conn *websocket.WebSocketConn, r *http.Request) {
+	logger.Infof("WS Open from %v", r.RemoteAddr)
+
 	conn.On("message", func(message []byte) {
-		logger.Infof("On message %v", string(message))
-		var body json.RawMessage
-		request := Request{
-			Data: &body,
-		}
-		err := json.Unmarshal(message, &request)
-		if err != nil {
-			logger.Errorf("Unmarshal error %v", err)
+		var raw json.RawMessage
+		req := Request{Data: &raw}
+
+		if err := json.Unmarshal(message, &req); err != nil {
+			logger.Warningf("Failed to unmarshal message: %v", err)
 			return
 		}
 
-		var data map[string]interface{}
-		err = json.Unmarshal(body, &data)
-		if err != nil {
-			logger.Errorf("Unmarshal error %v", err)
-			return
-		}
-
-		switch request.Type {
+		switch req.Type {
 		case New:
 			var info PeerInfo
-			err := json.Unmarshal(body, &info)
-			if err != nil {
-				logger.Errorf("Unmarshal login error %v", err)
+			if err := json.Unmarshal(raw, &info); err != nil {
+				logger.Warningf("Failed to unmarshal peer info: %v", err)
 				return
 			}
-			s.peers[info.ID] = Peer{
-				conn: conn,
-				info: info,
+			
+			s.mu.Lock()
+			s.peers[info.ID] = Peer{conn: conn, info: info}
+			s.mu.Unlock()
+			
+			s.NotifyPeersUpdate(s.peers)
+
+		case Offer, Answer, Candidate:
+			var n Negotiation
+			if err := json.Unmarshal(raw, &n); err != nil {
+				logger.Warningf("Failed to unmarshal negotiation: %v", err)
+				return
 			}
-			s.NotifyPeersUpdate(conn, s.peers)
-			break
-		case Leave:
-		case Offer:
-			fallthrough
-		case Answer:
-			fallthrough
-		case Candidate:
-			{
-				var negotiation Negotiation
-				err := json.Unmarshal(body, &negotiation)
-				if err != nil {
-					logger.Errorf("Unmarshal "+string(request.Type)+" got error %v", err)
-					return
+			
+			s.mu.RLock()
+			peer, ok := s.peers[n.To]
+			s.mu.RUnlock()
+			
+			if ok {
+				if err := s.Send(peer.conn, req); err != nil {
+					logger.Warningf("Failed to send %s to %s: %v", req.Type, n.To, err)
 				}
-				to := negotiation.To
-				peer, ok := s.peers[to]
-				if !ok {
-					msg := Request{
-						Type: "error",
-						Data: Error{
-							Request: string(request.Type),
-							Reason:  "Peer [" + to + "] not found ",
-						},
-					}
-					s.Send(conn, msg)
-					return
-				}
-				s.Send(peer.conn, request)
+			} else {
+				logger.Warningf("Peer %s not found for %s from %s", n.To, req.Type, n.From)
 			}
-			break
+
 		case Bye:
 			var bye Byebye
-			err := json.Unmarshal(body, &bye)
-			if err != nil {
-				logger.Errorf("Unmarshal bye got error %v", err)
+			if err := json.Unmarshal(raw, &bye); err != nil {
+				logger.Warningf("Failed to unmarshal bye: %v", err)
 				return
 			}
-
+			
 			ids := strings.Split(bye.SessionID, "-")
-			if len(ids) != 2 {
-				msg := Request{
-					Type: "error",
-					Data: Error{
-						Request: string(request.Type),
-						Reason:  "Invalid session [" + bye.SessionID + "]",
-					},
-				}
-				s.Send(conn, msg)
-				return
-			}
-
-			sendBye := func(id string) {
+			for _, id := range ids {
+				s.mu.RLock()
 				peer, ok := s.peers[id]
-
-				if !ok {
-					msg := Request{
-						Type: "error",
-						Data: Error{
-							Request: string(request.Type),
-							Reason:  "Peer [" + id + "] not found.",
+				s.mu.RUnlock()
+				
+				if ok {
+					s.Send(peer.conn, Request{
+						Type: Bye,
+						Data: map[string]string{
+							"session_id": bye.SessionID,
+							"from": bye.From,
 						},
-					}
-					s.Send(conn, msg)
-					return
+					})
 				}
-				bye := Request{
-					Type: "bye",
-					Data: map[string]interface{}{
-						"to":         id,
-						"session_id": bye.SessionID,
-					},
-				}
-				s.Send(peer.conn, bye)
 			}
-
-			// send to aleg
-			sendBye(ids[0])
-			//send to bleg
-			sendBye(ids[1])
 
 		case Keepalive:
-			s.Send(conn, request)
+			// Echo back keepalive
+			s.Send(conn, req)
+
 		default:
-			logger.Warnf("Unkown request %v", request)
+			logger.Warningf("Unknown message type: %s", req.Type)
 		}
 	})
 
 	conn.On("close", func(code int, text string) {
-		logger.Infof("On Close %v", conn)
-		var peerID string = ""
-
-		for _, peer := range s.peers {
+		logger.Infof("WS Close from %v: code=%d, text=%s", r.RemoteAddr, code, text)
+		
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		
+		var removedID string
+		for id, peer := range s.peers {
 			if peer.conn == conn {
-				peerID = peer.info.ID
-			} else {
-				leave := Request{
-					Type: "leave",
-					Data: peer.info.ID,
-				}
-				s.Send(peer.conn, leave)
+				removedID = id
+				break
 			}
 		}
-
-		logger.Infof("Remove peer %s", peerID)
-		if peerID == "" {
-			logger.Infof("Leve peer id not found")
-			return
+		
+		if removedID != "" {
+			delete(s.peers, removedID)
+			logger.Infof("Removed peer %s", removedID)
+			
+			// Notify remaining peers
+			if len(s.peers) > 0 {
+				req := Request{
+					Type: "leave",
+					Data: removedID,
+				}
+				for _, peer := range s.peers {
+					s.Send(peer.conn, req)
+				}
+			}
 		}
-		delete(s.peers, peerID)
-
-		s.NotifyPeersUpdate(conn, s.peers)
 	})
 }
